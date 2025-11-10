@@ -7,16 +7,18 @@ output: html_notebook
 # install.packages("tidyverse")
 library(tidyverse)
 library(readr) #read_csv()
+library(dplyr)
 ```
 
 
-# 1) Load Data
+### 1) Load Data
 ```{r}
 # Load data:
 df <- read_csv("./data/walmart/Walmart.csv")
 head(df)
 ```
 
+**Fix Datatypes, Sort Values**
 ```{r}
 # Fixing datatypes:
 # any(grepl("/", df$Date))
@@ -35,4 +37,40 @@ table(df$Date) # value_counts
 ```
 
 **There are 45 stores, so this makes sense, that there are 45 entries for each date. Also, each date represents one week.**
+
+
+**Normalize weekly sales within each store, so that no one store dominates, and weekly sales are comparable:**
+i.e. (sales_store - mean(sales_store)) / std(sales_store)
+and can convert back later via (scaled_sales * store_std) + store_mean
+```{r}
+df <- df %>%
+  group_by(Store) %>%
+  mutate(
+    sales_mean = mean(Weekly_Sales, na.rm = TRUE),
+    sales_std   = sd(Weekly_Sales, na.rm = TRUE),
+    weekly_sales_scaled = (Weekly_Sales - sales_mean) / sales_std
+  ) %>%
+  ungroup()
+head(df)
+```
+
+```{r}
+for (store_id in 1:length(unique(df$Store))) {
+  p <- df %>%
+    filter(Store == store_id) %>%
+    ggplot(aes(x = Date, y = weekly_sales_scaled)) +
+    geom_line(color = "steelblue") +
+    labs(title = paste("Weekly Sales Over Time - Store", store_id),
+         x = "Date",
+         y = "Weekly Sales (scaled per store)")
+  print(p)
+  }
+
+
+```
+
+# 2) LASSO - baseline, NO lagged variables.
+```{r}
+
+```
 
