@@ -1,0 +1,38 @@
+---
+title: "Lasso - Walmart"
+output: html_notebook
+---
+
+```{r}
+# install.packages("tidyverse")
+library(tidyverse)
+library(readr) #read_csv()
+```
+
+
+# 1) Load Data
+```{r}
+# Load data:
+df <- read_csv("./data/walmart/Walmart.csv")
+head(df)
+```
+
+```{r}
+# Fixing datatypes:
+# any(grepl("/", df$Date))
+print(sapply(df, class))
+df$Date <- gsub("/", "-", df$Date) # replace slashes with dashes, so all dates follow same format
+df$Date <- as.Date(df$Date, format = "%d-%m-%Y") # NOTE european-like date: day/month/year
+print(sapply(df, class))
+
+# Sort values:
+df <- df[order(df$Date, decreasing = FALSE), ] # gets an ordering of rows based on date and then df[ix] to select that order
+head(df)
+```
+```{r}
+print(dim(df))
+table(df$Date) # value_counts
+```
+
+**There are 45 stores, so this makes sense, that there are 45 entries for each date. Also, each date represents one week.**
+
