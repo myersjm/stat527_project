@@ -5,9 +5,13 @@ output: html_notebook
 
 ```{r}
 # install.packages("tidyverse")
+# install.packages("timetk")
 library(tidyverse)
 library(readr) #read_csv()
 library(dplyr)
+library(glmnet)
+library(caret) # may not need anymore
+library(timetk)
 ```
 
 
@@ -69,7 +73,70 @@ for (store_id in 1:length(unique(df$Store))) {
 
 ```
 
-# 2) LASSO - baseline, NO lagged variables.
+### 2) Train/Test split on sorted data:
+```{r}
+# Can't randomize the data first, because it is time-series
+split_ix <- floor(.8*nrow(df))
+train_df <- df[1:split_ix,]
+test_df <- df[(split_ix+1):nrow(df),]
+
+print(dim(train_df))
+print(dim(test_df))
+cat("train:", format(min(train_df$Date), "%Y-%m-%d"), " to ", format(max(train_df$Date), "%Y-%m-%d"),"\n")
+cat("test:", format(min(test_df$Date), "%Y-%m-%d"), " to ", format(max(test_df$Date), "%Y-%m-%d"),"\n")
+
+print(colnames(df))
+# model.matrix creates a design matrix, auto-encodes categorical as dummy vars (if any--in this case, holiday is already a double.)
+# X_train <- model.matrix(weekly_sales_scaled ~ . - Store - Date - Weekly_Sales - sales_mean - sales_std + 0, data=train_df) # + 0 means no intercept
+X_test <- model.matrix(weekly_sales_scaled ~ . - Store - Date - Weekly_Sales - sales_mean - sales_std + 0, data=test_df)
+# y_train <- train_df$weekly_sales_scaled
+y_test <- test_df$weekly_sales_scaled
+# NOTE: i just commented out X_train because realized cv function requires dataframe.
+
+print(dim(X_test))
+#print(dim(X_train))
+#print(X_train[1:10,])
+print(X_test[1:10,])
+```
+
+### 3) LASSO with Rolling Time-series cross validation
+Because, it is important to keep the future in the test, or else it could cheat and 
+accidentally learn the past and use it to predict the past, some inherent pattern.
+i.e. could use info from the future to predict the past (leakage).
+
+```{r}
+cv_folds <- time_series_cv(
+  data = train_df,
+  date_var = Date,
+  cumulative = FALSE, # no growing window (same size folds)
+  initial = "6 months", # length of train window
+  assess = "3 months", # length of validation window
+  skip = "3 months", # jump between folds
+  slice_limit = 5 # num folds max
+)
+
+plot_time_series_cv_plan(cv_folds, .date_var = Date, .value = weekly_sales_scaled)
+```
+
+
+
+
+### Old code----
+Set up cross validation folds, for time-series.
+
+```{r}
+n_train <- nrow(train_df)
+folds <- createTimeSlices(1:n_train, 
+                          initialWindow = floor(0.7*n_train), # 70% is train data
+                          horizon = floor(0.1*n), # 10% is val data 
+                          fixedWindow = TRUE) # do not grow the time slice windows with time--do rolling. 
+
+str(folds$train[1:3])
+
+```
+
+
+### 4) LASSO - baseline, NO lagged variables.
 ```{r}
 
 ```
