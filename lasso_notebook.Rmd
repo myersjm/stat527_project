@@ -12,6 +12,7 @@ library(dplyr)
 library(glmnet)
 library(caret) # may not need anymore
 library(timetk)
+library(rsample)
 ```
 
 
@@ -75,7 +76,8 @@ for (store_id in 1:length(unique(df$Store))) {
 
 ### 2) Train/Test split on sorted data:
 ```{r}
-# Can't randomize the data first, because it is time-series
+# (Can't randomize the data first, because it is time-series)
+# Train/Test Split:
 split_ix <- floor(.8*nrow(df))
 train_df <- df[1:split_ix,]
 test_df <- df[(split_ix+1):nrow(df),]
@@ -84,19 +86,17 @@ print(dim(train_df))
 print(dim(test_df))
 cat("train:", format(min(train_df$Date), "%Y-%m-%d"), " to ", format(max(train_df$Date), "%Y-%m-%d"),"\n")
 cat("test:", format(min(test_df$Date), "%Y-%m-%d"), " to ", format(max(test_df$Date), "%Y-%m-%d"),"\n")
-
 print(colnames(df))
-# model.matrix creates a design matrix, auto-encodes categorical as dummy vars (if any--in this case, holiday is already a double.)
-# X_train <- model.matrix(weekly_sales_scaled ~ . - Store - Date - Weekly_Sales - sales_mean - sales_std + 0, data=train_df) # + 0 means no intercept
-X_test <- model.matrix(weekly_sales_scaled ~ . - Store - Date - Weekly_Sales - sales_mean - sales_std + 0, data=test_df)
-# y_train <- train_df$weekly_sales_scaled
+
+# Define design matrix pattern (to make it easier to form X's during cross val):
+design_matrix_formula <- weekly_sales_scaled ~ . - Store - Date - Weekly_Sales - sales_mean - sales_std + 0 # 0 means no intercept, glmnet will add its own; here we drop columns
+
+# model.matrix creates a design matrix from formula, auto-encodes categorical as dummy vars (if any--in this case, holiday is already a double.)
+X_test <- model.matrix(design_matrix_formula, data=test_df)
 y_test <- test_df$weekly_sales_scaled
-# NOTE: i just commented out X_train because realized cv function requires dataframe.
 
 print(dim(X_test))
-#print(dim(X_train))
-#print(X_train[1:10,])
-print(X_test[1:10,])
+print(X_test[1:10,]) # see example of columns left for prediction
 ```
 
 ### 3) LASSO with Rolling Time-series cross validation
@@ -115,25 +115,84 @@ cv_folds <- time_series_cv(
   slice_limit = 5 # num folds max
 )
 
-plot_time_series_cv_plan(cv_folds, .date_var = Date, .value = weekly_sales_scaled)
+plot_time_series_cv_plan(cv_folds, .date_var = Date, .value = weekly_sales_scaled, .interactive=TRUE)
 ```
-
-
-
-
-### Old code----
-Set up cross validation folds, for time-series.
 
 ```{r}
-n_train <- nrow(train_df)
-folds <- createTimeSlices(1:n_train, 
-                          initialWindow = floor(0.7*n_train), # 70% is train data
-                          horizon = floor(0.1*n), # 10% is val data 
-                          fixedWindow = TRUE) # do not grow the time slice windows with time--do rolling. 
-
-str(folds$train[1:3])
-
+# === Define Lambda search grid ===
+# Easy way to get lambda grid with good scaling--from the glmnet function itself.
+# Note that we will not keep this model fit, this is solely for the purpose of getting
+# a lambda grid for our manual CV.
+unused_X_all <- model.matrix(design_matrix_formula, data=train_df)
+unused_y_all <- train_df$weekly_sales_scaled
+unused_model <- glmnet(unused_X_all, unused_y_all, alpha=1)
+lambda_grid <- unused_model$lambda
+lambda_grid
 ```
+
+
+```{r}
+n_folds <- length(cv_folds$splits)
+n_lambdas <- length(lambda_grid)
+cv_mses <- numeric(n_lambdas) # keep track of MSE across different lambdas
+lambda_ix <- 1
+
+for (lambda in lambda_grid) {
+  fold_mses <- numeric(n_folds) # array for keeping track of mse across folds
+  
+  for (fold_ix in 1:n_folds) {
+    # Get train, valid data for current cv fold:
+    fold <- cv_folds$splits[[fold_ix]]
+    train_data <- analysis(fold)
+    valid_data <- assessment(fold)
+    
+    # Manipulate data into design matrices:
+    X_train <- model.matrix(design_matrix_formula, data=train_data)
+    y_train <- train_data$weekly_sales_scaled
+    X_val <- model.matrix(design_matrix_formula, data=valid_data)
+    y_val <- valid_data$weekly_sales_scaled
+    
+    # Fit LASSO (non-cv version):
+    lasso_model <- glmnet(X_train, y_train, alpha=1, lambda=lambda)
+    
+    # Get val error:
+    yhat_val <- predict(lasso_model, newx=X_val, s=lambda)
+    fold_mses[fold_ix] <- mean((y_val - yhat_val)^2)
+  }
+  cv_mses[lambda_ix] <- mean(fold_mses)
+  lambda_ix <- lambda_ix + 1
+  
+}
+
+best_lambda <- lambda_grid[which.min(cv_mses)]
+cat("best lambda: ", best_lambda, "with min mse ", min(cv_mses), "\n\n")
+```
+
+```{r}
+plot(x=lambda_grid,
+     y=cv_mses,
+     main = paste0(n_folds, "-Fold Cross-Validation MSE for different Lambdas"),
+     xlab = "Lambda",
+     ylab = "Mean CV MSE")
+#best_ix <- which.min(cv_mses)
+#points(best_lambda, cv_mses[best_ix], col = "red", pch = 19, cex = 1.5)
+#text(best_lambda, cv_mses[best_ix],
+#     labels = paste("Best λ =", round(best_lambda, 4)),
+#     pos = 4, col = "red")
+```
+### 4) Fit model with best lambda on full data, get test error:
+```{r}
+X_train <- model.matrix(design_matrix_formula, data=train_df)
+y_train <- train_df$weekly_sales_scaled
+best_lasso_model <- glmnet(X_train, y_train, alpha=1, lambda=best_lambda)
+
+ # Get val error:
+yhat_test <- predict(best_lasso_model, newx=X_test, s=best_lambda)
+mse_test <- mean((y_test - yhat_test)^2)
+cat("Test MSE: ", mse_test, "\n\n")
+coef(best_lasso_model)
+```
+
 
 
 ### 4) LASSO - baseline, NO lagged variables.
