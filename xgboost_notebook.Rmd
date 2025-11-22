@@ -1,0 +1,96 @@
+---
+title: "XGBoost - Walmart"
+output: html_notebook
+---
+
+We will explore the XGBoost method in this notebook.
+
+### Load Packages and Data
+```{r}
+library(tidyverse)
+library(xgboost)
+
+# Load data:
+df <- read_csv("./data/walmart/Walmart.csv")
+head(df)
+```
+
+### Data Preprocessing and Feature Engineering
+
+We should first change the `Store` and `Holiday_Flag` columns to factors and reformat the `Date` column as a Date type, and then sort the rows by `Date`.
+
+```{r}
+df$Store <- as.factor(df$Store)
+df$Holiday_Flag <- as.factor(df$Holiday_Flag)
+
+df$Date <- gsub("/", "-", df$Date)
+df$Date <- as.Date(df$Date, format = "%d-%m-%Y")
+
+df <- df[order(df$Date, decreasing = FALSE), ]
+head(df)
+```
+
+
+Let's create a data set containing several different lags and moving averages for weekly sales.
+
+```{r}
+library(slider)
+
+# create data set I
+df_lag_ma <- df %>% group_by(Store) %>%
+  mutate(
+    lag_1 = lag(Weekly_Sales, 1), 
+    lag_4 = lag(Weekly_Sales, 4),
+    lag_52 = lag(Weekly_Sales, 52),
+    ma_4 = slide_dbl(Weekly_Sales, mean, 
+                    .before = 3, .complete = TRUE),
+    ma_8  = slide_dbl(Weekly_Sales, mean, 
+                    .before = 7, .complete = TRUE)
+  ) %>%
+  ungroup()
+
+head(df_lag_ma)
+```
+
+We can also create a data set without lags or moving averages, but with fields for the week of the year.
+
+```{r}
+# create data set II
+df_wk <- df %>% 
+  mutate(
+    isoweek = isoweek(Date)
+  )
+
+head(df_wk)
+```
+
+### XGBoost
+Let's fit an XGBoost on the two data sets, using the last 52 weeks as test data and the rest as training data. For the first data set, we can fit several models by choosing which lags and moving averages to include. We need to remove missing values before fitting the models; using more past data will make the training set smaller, but may give better predictions.
+
+```{r}
+set.seed(0)
+
+library(xgboost)
+
+n <- nrow(df)
+n_test <- 52 * 45 # number of test rows
+test_idx <- (n-n_test+1):n
+
+df_lag_ma <- df_lag_ma %>% select(-Date) # remove Date column
+
+# remove NAs before splitting
+train1 <- df_lag_ma[-test_idx,]
+test1 <- df_lag_ma[test_idx,]
+
+train1X <- model.matrix(Weekly_Sales ~ ., data=train1)
+
+xgb1 <- xgboost(data = train1X, label = train1$Weekly_Sales, 
+                max.depth = 2, eta = 1, nthread = 2, nrounds = 2, 
+                objective = "reg:squarederror")
+```
+
+
+
+
+
+
