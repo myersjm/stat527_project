@@ -105,11 +105,24 @@ accidentally learn the past and use it to predict the past, some inherent patter
 i.e. could use info from the future to predict the past (leakage).
 
 ```{r}
+# NOTE - ctrl shift c to mass uncomment/comment out
+# Attempt 1 - shorter
+# cv_folds <- time_series_cv(
+#   data = train_df,
+#   date_var = Date,
+#   cumulative = FALSE, # no growing window (same size folds)
+#   initial = "6 months", # length of train window
+#   assess = "3 months", # length of validation window
+#   skip = "3 months", # jump between folds
+#   slice_limit = 5 # num folds max
+# )
+
+# Attempt 2-- longer, cumulative windowing
 cv_folds <- time_series_cv(
   data = train_df,
   date_var = Date,
-  cumulative = FALSE, # no growing window (same size folds)
-  initial = "6 months", # length of train window
+  cumulative = TRUE, # growing window (same size folds)
+  initial = "1 year", # length of train window
   assess = "3 months", # length of validation window
   skip = "3 months", # jump between folds
   slice_limit = 5 # num folds max
@@ -193,10 +206,64 @@ cat("Test MSE: ", mse_test, "\n\n")
 coef(best_lasso_model)
 ```
 
+**First CV param attempt notes:**
+The above serves as a baseline, when using no time-averaging or time-lagged features. It could just predict the mean, not finding a strong signal with the other features. Next, we will need to try incorporating time. In the meantime, some things I will try are changing the folds and lambdas used.
 
+**second CV param attempt notes:**
+Second attempt, used 1 year initial, and cumulative folds. Now holidays and temperature matter, which is better than the first attempt, which had 0's for all features and intercept was the only kept feature. MSE stayed the same.
 
-### 4) LASSO - baseline, NO lagged variables.
+LASSO - baseline, NO lagged variables.
+
+### 5) Plots to analyze the results
+**Lasso Path--shows variables entering and leaving as lambda (regularization) increases. (NOT cross val).**
 ```{r}
+fit_path <- glmnet(X_train, y_train, alpha = 1)  # doesnt take best lambda, fits a bunch of lambdas, no CV
+plot(fit_path, xvar = "lambda", label = TRUE)
+title("LASSO Coefficient Paths")
 
+
+# attempting to get a mapping to var names but this doesnt include intercept (TODO)
+beta_mat <- as.matrix(fit_path$beta)
+#rownames(beta_mat)
+variable_map <- data.frame(
+  index = seq_len(nrow(beta_mat)),
+  variable = rownames(beta_mat)
+)
+
+print(variable_map)
+```
+```{r}
+ # 1) Extract coefficients for each tested lambda value, and convert datatype to R matrix:
+ Beta_lambda <- as.matrix(coef(fit_path, s=fit_path$lambda))
+ 
+ # 2) Even tho I didn't specify intercept, there is a intercept row of 0's. 
+#Beta_lambda <- Beta_lambda[-1,, drop=FALSE] # all rows except row 1, all columns; dont change dimensions
+ # print(Beta_lambda)
+ cat('Beta_lambda shape:', dim(Beta_lambda), '\n') # shape: (p x #lambdas
+ 
+ # 3) Get L0, L1 norms:
+ l1_norm = colSums(abs(Beta_lambda)) # sum up each betah_lambda col; colSums computes sum of each column
+ l0_norm = colSums(Beta_lambda != 0) # number of nonzero coeffs for each lambda
+ # 4) Want the plot's x axis to be increasing model complexity (incr L1 norm to the right)
+ incr_order_ixs = order(l1_norm) # returns indices to make it incr order
+ l1_norm_ordered = l1_norm[incr_order_ixs]
+ l0_norm_ordered = l0_norm[incr_order_ixs]
+ Beta_lambda_ordered = Beta_lambda[,incr_order_ixs,drop=FALSE]
+ # 5) Plot coeff vs. L1 norm:
+ # note: currently, Beta_lambda's columns are for each lambda, but matplot plots columns of y
+ #       as separate lines. We want a line for each coeff (p). Beta_lambda is (p x #lambdas).
+ #       so, we take the transpose of beta.
+ #       also, num rows should match for x (#lambdas x 1) and y (p x #lambdas).
+ cat('L1 norm shape:', length(l1_norm_ordered), '\n')
+ cat('Beta_lambda shape:', dim(Beta_lambda_ordered), '\n')
+ 
+ matplot(x=l1_norm,  y=t(Beta_lambda),
+ type="l",# plot type: line
+ lwd=2, # line width
+ lty=1, # line type (solid, dashed)
+ xlab=expression("L1 Norm (" * "||" * hat(beta[lambda]) * "||"[1] * ")"),
+ ylab="Coefficients",
+ main="Lasso Path")
+ abline(h = 0, col = "black", lwd = 1, lty = 2) # show x axis more easily
 ```
 
