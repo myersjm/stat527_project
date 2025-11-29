@@ -30,7 +30,6 @@ df <- df[order(df$Date, decreasing = FALSE), ]
 head(df)
 ```
 
-
 Let's create a data set containing several different lags and moving averages for weekly sales.
 
 ```{r}
@@ -65,32 +64,184 @@ head(df_wk)
 ```
 
 ### XGBoost
-Let's fit an XGBoost on the two data sets, using the last 52 weeks as test data and the rest as training data. For the first data set, we can fit several models by choosing which lags and moving averages to include. We need to remove missing values before fitting the models; using more past data will make the training set smaller, but may give better predictions.
+Let's fit an XGBoost on the two data sets, using the last 52 weeks as test data and the rest as training data. Since the XGBoost algorithm is sparsity-aware, we do not need to remove missing lag and moving average values before fitting the models.
+
+It is also good to standardize the weekly sales by store, so that stores with larger weekly sales don't dominate the variable selection process. In this calculation, we look only at weekly sales in training rows, ignoring test rows. We can first create a function that performs a train/test split and handles the normalization of weekly sales.
+
+#### Data Set I
+
+```{r}
+train_test_split <- function(df, remove.na=T) {
+  if(remove.na) { df <- df %>% drop_na() }
+  
+  n <- nrow(df)
+  n_test <- 52 * 45 # number of test rows
+  test_idx <- (n-n_test+1):n
+  
+  train <- df[-test_idx,]
+  test <- df[test_idx,]
+  
+  # store the mean and sd of each store's weekly sales in a df
+  df_mean_std <- train %>%
+    group_by(Store) %>%
+    summarise(
+      store_mean = mean(Weekly_Sales),
+      store_sd = sd(Weekly_Sales)
+    )
+  
+  # scale the response in the train and test data
+  train <- train %>%
+    left_join(df_mean_std, by = "Store") %>%
+    mutate(
+      Weekly_Sales_Scaled = (Weekly_Sales - store_mean) / store_sd
+    )
+  
+  test <- test %>%
+    left_join(df_mean_std, by = "Store") %>%
+    mutate(
+      Weekly_Sales_Scaled = (Weekly_Sales - store_mean) / store_sd
+    )
+  
+  # formula for XGBoost model, using all original predictors
+  form <- formula("Weekly_Sales_Scaled ~ . - Weekly_Sales - store_mean - store_sd")
+  
+  trainX <- model.matrix(form, model.frame(form, train, na.action = 'na.pass'))
+  testX <- model.matrix(form, model.frame(form, test, na.action = 'na.pass'))
+  
+  trainY <- train$Weekly_Sales_Scaled
+  testY <- test$Weekly_Sales_Scaled
+  
+  list(
+    trainX=trainX, trainY=trainY,
+    testX=testX, testY=testY,
+    traindf=train, testdf=test
+  )
+}
+```
+
+We can now perform a grid search for the best hyperparameters.
 
 ```{r}
 set.seed(0)
 
 library(xgboost)
 
-n <- nrow(df)
-n_test <- 52 * 45 # number of test rows
-test_idx <- (n-n_test+1):n
+# create the train and test data
+df1 <- df_lag_ma %>% select(-Date)
 
-df_lag_ma <- df_lag_ma %>% select(-Date) # remove Date column
+split_data <- train_test_split(df1, remove.na = F)
 
-# remove NAs before splitting
-train1 <- df_lag_ma[-test_idx,]
-test1 <- df_lag_ma[test_idx,]
+train1X <- split_data$trainX; train1Y <- split_data$trainY
+test1X <- split_data$testX; test1Y <- split_data$testY
+train1 <- split_data$traindf; test1 <- split_data$testdf
 
-train1X <- model.matrix(Weekly_Sales ~ ., data=train1)
+# initialize parameter grid
+param_grid <- expand.grid(
+  max.depth = c(3:10),
+  eta = c(0.05, 0.1, 0.25, 0.5),
+  gamma = c(0, 0.25, 0.5),
+  subsample = c(0.5, 1),
+  colsample_bytree = c(0.5, 1)
+)
 
-xgb1 <- xgboost(data = train1X, label = train1$Weekly_Sales, 
-                max.depth = 2, eta = 1, nthread = 2, nrounds = 2, 
-                objective = "reg:squarederror")
+# function to calculate WAPE
+calculate_WAPE <- function(y, yhat) {
+  sum(abs(y-yhat))/sum(abs(y))
+}
+
+# fit an XGBoost model, using each combination of params
+WAPEs <- numeric(nrow(param_grid))
+
+for(i in 1:nrow(param_grid)) {
+  param_list <- lapply(param_grid[i,], function(x) x)
+  
+  xgb1 <- xgboost(
+    data = train1X, label = train1Y, 
+    params = param_list, nthread = 10, 
+    nrounds = 500, early_stopping_rounds = 25,
+    objective = "reg:squarederror", verbose = 0
+  )
+  
+  pred <- predict(xgb1, test1X)
+  yhat <- test1$store_sd * pred + test1$store_mean
+  
+  # store the WAPE
+  WAPEs[i] <- calculate_WAPE(test1$Weekly_Sales, yhat)
+}
+
+min(WAPEs) # smallest WAPE
+opt_params <- param_grid[which.min(WAPEs),]
+opt_params # optimal parameter set
 ```
 
+After obtaining the optimal hyperparameters from the grid search, we can train a final XGBoost model with them.
 
+```{r}
+opt_param_list <- lapply(opt_params, function(x) x)
 
+xgb1_opt <- xgboost(
+  data = train1X, label = train1Y, 
+  params = opt_param_list, nthread = 10, 
+  nrounds = 500, early_stopping_rounds = 25,
+  objective = "reg:squarederror", verbose = 0
+)
 
+xgb.importance(model=xgb1_opt)
+```
 
+#### Data Set II
+
+```{r}
+set.seed(0)
+
+# create the train and test data
+df2 <- df_wk %>% select(-Date)
+
+split_data2 <- train_test_split(df2, remove.na = F)
+
+train2X <- split_data2$trainX; train2Y <- split_data2$trainY
+test2X <- split_data2$testX; test2Y <- split_data2$testY
+train2 <- split_data2$traindf; test2 <- split_data2$testdf
+
+WAPEs_2 <- numeric(nrow(param_grid))
+
+for(i in 1:nrow(param_grid)) {
+  param_list <- lapply(param_grid[i,], function(x) x)
+  
+  xgb2 <- xgboost(
+    data = train2X, label = train2Y, 
+    params = param_list, nthread = 10, 
+    nrounds = 500, early_stopping_rounds = 25,
+    objective = "reg:squarederror", verbose = 0
+  )
+  
+  pred <- predict(xgb2, test2X)
+  yhat <- test2$store_sd * pred + test2$store_mean
+  
+  # store the WAPE
+  WAPEs_2[i] <- calculate_WAPE(test2$Weekly_Sales, yhat)
+}
+
+min(WAPEs_2) # smallest WAPE
+opt_params2 <- param_grid[which.min(WAPEs_2),]
+opt_params2 # optimal parameter set
+
+opt_param_list2 <- lapply(opt_params2, function(x) x)
+
+xgb2_opt <- xgboost(
+  data = train2X, label = train2Y, 
+  params = opt_param_list2, nthread = 10, 
+  nrounds = 200, early_stopping_rounds = 10,
+  objective = "reg:squarederror", verbose = 0
+)
+
+xgb.importance(model=xgb2_opt)
+```
+
+### Comparison
+Based on the WAPEs, we can see that the XGBoost algorithm performed better on data set II, which contained the numeric week of the year (`isoweek`) but no information on lag or moving averages. The subset of predictors chosen by the models were also very different:
+
+- In data set I, the most important variable was `Fuel_Price`, followed closely by the moving average of 4 consecutive weekly sales. No single variable was significantly more important than the others.
+- In data set II, the variable `isoweek` was by far the most important, with a gain 4 times as much as the next most important predictor, `Temperature`.
+- In both data sets, the stores were the least important variables. This makes sense because we standardized the weekly sales by store before running the algorithm, so the effect of the store was not captured.
 
