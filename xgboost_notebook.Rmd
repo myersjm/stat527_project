@@ -11,133 +11,132 @@ library(tidyverse)
 library(xgboost)
 
 # Load data:
-df <- read_csv("./data/walmart/Walmart.csv")
+df <- read_csv("./data/walmart_features.csv")
 head(df)
 ```
 
-### Data Preprocessing and Feature Engineering
+### Data Preprocessing
 
-We should first change the `Store` and `Holiday_Flag` columns to factors and reformat the `Date` column as a Date type, and then sort the rows by `Date`.
+We should first change the `store` and `holiday_flag` columns to factors, and then sort by date. We can also drop the variable `is_holiday_num`, since it contains the exact same information as `holiday_flag`.
 
 ```{r}
-df$Store <- as.factor(df$Store)
-df$Holiday_Flag <- as.factor(df$Holiday_Flag)
+df <- df %>%
+  mutate(
+    store = as.factor(store), 
+    holiday_flag = factor(holiday_flag, levels = unique(holiday_flag))
+  ) %>% 
+  arrange(date, store) %>% select(-is_holiday_num)
 
-df$Date <- gsub("/", "-", df$Date)
-df$Date <- as.Date(df$Date, format = "%d-%m-%Y")
-
-df <- df[order(df$Date, decreasing = FALSE), ]
 head(df)
 ```
 
 Let's create a data set containing several different lags and moving averages for weekly sales.
 
-```{r}
-library(slider)
 
-# create data set I
-df_lag_ma <- df %>% group_by(Store) %>%
-  mutate(
-    lag_1 = lag(Weekly_Sales, 1), 
-    lag_4 = lag(Weekly_Sales, 4),
-    lag_52 = lag(Weekly_Sales, 52),
-    ma_4 = slide_dbl(Weekly_Sales, mean, 
-                    .before = 3, .complete = TRUE),
-    ma_8  = slide_dbl(Weekly_Sales, mean, 
-                    .before = 7, .complete = TRUE)
-  ) %>%
-  ungroup()
+### Cross-Validation and Train/Test Split
 
-head(df_lag_ma)
-```
+We will perform 5-fold time series cross-validation to select the best hyperparameters. In each training set, we standardize any columns related to the sales, such as lags and moving averages, by store. This is to prevent stores with high weekly sales from dominating the variable selection process.
 
-We can also create a data set without lags or moving averages, but with fields for the week of the year.
+We then scale these columns in each testing set using the corresponding mean and standard deviation of the training set.
 
 ```{r}
-# create data set II
-df_wk <- df %>% 
-  mutate(
-    isoweek = isoweek(Date)
-  )
+# function for standardizing training columns
+standardize_sales_columns <- function(df, col_vec) {
+  # standardize the columns, grouping by store first
+  df_new <- df %>% group_by(store) %>% 
+    mutate(across(any_of(col_vec), function(x) scale(x))) %>%
+    ungroup()
+  
+  # store the mean and sd of the original columns (grouped by store)
+  df_mean_sd <- df %>% group_by(store) %>%
+    summarise(across(any_of(col_vec),
+                     list(mean = mean, sd = sd),
+                     na.rm = TRUE))
+  
+  list(df_new = df_new, df_mean_sd = df_mean_sd)
+}
 
-head(df_wk)
+# function for standardizing test columns, given training column stats
+scale_test_sales_columns <- function(df, col_vec, df_mean_sd) {
+  df_new <- df %>% left_join(df_mean_sd, by="store")
+  
+  for(cname in col_vec) {
+    cname_mean <- paste(cname, "mean", sep="_")
+    cname_sd <- paste(cname, "sd", sep="_")
+    
+    df_new[,cname] <- (df_new[,cname] - df_new[,cname_mean])/ df_new[,cname_sd]
+  }
+  
+  df_new %>% select(-any_of(colnames(df_mean_sd)[-1]))
+}
+
+# function to create data sets for time series CV
+train_test_cv <- function(df, std_vec, nfolds=5) {
+  dat <- list()
+  
+  dates <- sort(unique(df$date))
+  nweeks <- length(dates)
+  test_len <- ceiling(nweeks/(2*nfolds))
+  idx <- nweeks - c(nfolds:1)*test_len
+  
+  # expanding window CV
+  for (fold in seq(nfolds)) {
+    train_idx <- idx[fold]
+    test_idx <- idx[fold]+test_len
+    
+    train <- df %>% filter(date <= dates[train_idx])
+    test <- df %>% filter(date > dates[train_idx], date <= dates[test_idx])
+    
+    # standardize the training columns
+    std_cols <- standardize_sales_columns(train, std_vec)
+    train_std <- std_cols$df_new
+    train_stats <- std_cols$df_mean_sd
+    
+    # scale the test columns, excluding the response
+    std_vec1 <- std_vec[std_vec != "weekly_sales"]
+    test_std <- scale_test_sales_columns(test, std_vec1, train_stats)
+    
+    # return the mean and sd of Y to denormalize after prediction
+    resp_stats <- train_stats %>% 
+      select(store, weekly_sales_mean, weekly_sales_sd)
+    
+    
+    trainX <- model.matrix(weekly_sales ~ ., train_std)
+    testX <- model.matrix(weekly_sales ~ ., test_std)
+    
+    trainY <- train_std$weekly_sales 
+    testYlab <- test_std %>% select(store, weekly_sales) # not standardized
+    
+    dat[[fold]] <- list(
+      trainX=trainX, trainY=trainY,
+      testX=testX, testYlab=testYlab,
+      y_mean_sd=resp_stats
+    )
+  }
+  
+  dat
+}
+
+# variables to standardize
+std_vec <- c("weekly_sales", "lag1", "lag2", "lag4", "lag8",
+             "ma4", "ma8", "store_mean_to_prev", "store_sd_to_prev",
+             "inter_holiday_lag1")
+
+cv_data <- train_test_cv(df, std_vec)
 ```
+
 
 ### XGBoost
-Let's fit an XGBoost on the two data sets, using the last 52 weeks as test data and the rest as training data. Since the XGBoost algorithm is sparsity-aware, we do not need to remove missing lag and moving average values before fitting the models.
-
-It is also good to standardize the weekly sales by store, so that stores with larger weekly sales don't dominate the variable selection process. In this calculation, we look only at weekly sales in training rows, ignoring test rows. We can first create a function that performs a train/test split and handles the normalization of weekly sales.
-
-#### Data Set I
-
-```{r}
-train_test_split <- function(df, remove.na=T) {
-  if(remove.na) { df <- df %>% drop_na() }
-  
-  n <- nrow(df)
-  n_test <- 52 * 45 # number of test rows
-  test_idx <- (n-n_test+1):n
-  
-  train <- df[-test_idx,]
-  test <- df[test_idx,]
-  
-  # store the mean and sd of each store's weekly sales in a df
-  df_mean_std <- train %>%
-    group_by(Store) %>%
-    summarise(
-      store_mean = mean(Weekly_Sales),
-      store_sd = sd(Weekly_Sales)
-    )
-  
-  # scale the response in the train and test data
-  train <- train %>%
-    left_join(df_mean_std, by = "Store") %>%
-    mutate(
-      Weekly_Sales_Scaled = (Weekly_Sales - store_mean) / store_sd
-    )
-  
-  test <- test %>%
-    left_join(df_mean_std, by = "Store") %>%
-    mutate(
-      Weekly_Sales_Scaled = (Weekly_Sales - store_mean) / store_sd
-    )
-  
-  # formula for XGBoost model, using all original predictors
-  form <- formula("Weekly_Sales_Scaled ~ . - Weekly_Sales - store_mean - store_sd")
-  
-  trainX <- model.matrix(form, model.frame(form, train, na.action = 'na.pass'))
-  testX <- model.matrix(form, model.frame(form, test, na.action = 'na.pass'))
-  
-  trainY <- train$Weekly_Sales_Scaled
-  testY <- test$Weekly_Sales_Scaled
-  
-  list(
-    trainX=trainX, trainY=trainY,
-    testX=testX, testY=testY,
-    traindf=train, testdf=test
-  )
-}
-```
-
-We can now perform a grid search for the best hyperparameters.
+Let's fit an XGBoost on this data sets, using time series cross-validation with a grid search to find optimal hyperparameters. We use the WAPE (weighted absolute percentage error) metric to determine the best hyperparameters and compare models.
 
 ```{r}
 set.seed(0)
 
 library(xgboost)
 
-# create the train and test data
-df1 <- df_lag_ma %>% select(-Date)
-
-split_data <- train_test_split(df1, remove.na = F)
-
-train1X <- split_data$trainX; train1Y <- split_data$trainY
-test1X <- split_data$testX; test1Y <- split_data$testY
-train1 <- split_data$traindf; test1 <- split_data$testdf
-
 # initialize parameter grid
 param_grid <- expand.grid(
-  max.depth = c(3:10),
+  max.depth = c(3, 6, 9),
   eta = c(0.05, 0.1, 0.25, 0.5),
   gamma = c(0, 0.25, 0.5),
   subsample = c(0.5, 1),
@@ -149,24 +148,44 @@ calculate_WAPE <- function(y, yhat) {
   sum(abs(y-yhat))/sum(abs(y))
 }
 
-# fit an XGBoost model, using each combination of params
-WAPEs <- numeric(nrow(param_grid))
+nfolds <- 5 # 5 folds
+
+n_rounds <- 200 # max rounds per training instance
+n_earlystop <- 20 # early stopping rounds
+
+WAPEs <- numeric(nrow(param_grid)) # store the WAPE
 
 for(i in 1:nrow(param_grid)) {
   param_list <- lapply(param_grid[i,], function(x) x)
   
-  xgb1 <- xgboost(
-    data = train1X, label = train1Y, 
-    params = param_list, nthread = 10, 
-    nrounds = 500, early_stopping_rounds = 25,
-    objective = "reg:squarederror", verbose = 0
-  )
+  WAPE_i <- numeric(nfolds)
   
-  pred <- predict(xgb1, test1X)
-  yhat <- test1$store_sd * pred + test1$store_mean
+  for(fold in seq(nfolds)) {
+    fold_data <- cv_data[[fold]]
+    
+    trainX <- fold_data$trainX; trainY <- fold_data$trainY
+    testX <- fold_data$testX; testYlab <- fold_data$testYlab
+    y_mean_sd <- fold_data$y_mean_sd
+    
+    xgb1 <- xgboost(
+      data = trainX, label = trainY, 
+      params = param_list, nthread = 10, 
+      nrounds = n_rounds, early_stopping_rounds = n_earlystop,
+      objective = "reg:squarederror", verbose = 0
+    )
+    
+    # create and denormalize the prediction
+    pred <- predict(xgb1, testX)
+    joined_yhat <- testYlab %>% left_join(y_mean_sd, by = "store") %>%
+      mutate(pred_denorm = (pred * weekly_sales_sd) + weekly_sales_mean)
+    
+    yhat <- joined_yhat$pred_denorm
+    
+    WAPE_i[fold] <- calculate_WAPE(testYlab$weekly_sales, yhat)
+  }
   
   # store the WAPE
-  WAPEs[i] <- calculate_WAPE(test1$Weekly_Sales, yhat)
+  WAPEs[i] <- mean(WAPE_i)
 }
 
 min(WAPEs) # smallest WAPE
@@ -174,74 +193,24 @@ opt_params <- param_grid[which.min(WAPEs),]
 opt_params # optimal parameter set
 ```
 
-After obtaining the optimal hyperparameters from the grid search, we can train a final XGBoost model with them.
+After obtaining the optimal hyperparameters from the grid search, we can train a final XGBoost model with them, using the final fold.
 
 ```{r}
 opt_param_list <- lapply(opt_params, function(x) x)
 
-xgb1_opt <- xgboost(
-  data = train1X, label = train1Y, 
+xgb_opt <- xgboost(
+  data = trainX, label = trainY, 
   params = opt_param_list, nthread = 10, 
-  nrounds = 500, early_stopping_rounds = 25,
+  nrounds = n_rounds, early_stopping_rounds = n_earlystop,
   objective = "reg:squarederror", verbose = 0
 )
-
-xgb.importance(model=xgb1_opt)
 ```
 
-#### Data Set II
+### Variable Importance
 
 ```{r}
-set.seed(0)
-
-# create the train and test data
-df2 <- df_wk %>% select(-Date)
-
-split_data2 <- train_test_split(df2, remove.na = F)
-
-train2X <- split_data2$trainX; train2Y <- split_data2$trainY
-test2X <- split_data2$testX; test2Y <- split_data2$testY
-train2 <- split_data2$traindf; test2 <- split_data2$testdf
-
-WAPEs_2 <- numeric(nrow(param_grid))
-
-for(i in 1:nrow(param_grid)) {
-  param_list <- lapply(param_grid[i,], function(x) x)
-  
-  xgb2 <- xgboost(
-    data = train2X, label = train2Y, 
-    params = param_list, nthread = 10, 
-    nrounds = 500, early_stopping_rounds = 25,
-    objective = "reg:squarederror", verbose = 0
-  )
-  
-  pred <- predict(xgb2, test2X)
-  yhat <- test2$store_sd * pred + test2$store_mean
-  
-  # store the WAPE
-  WAPEs_2[i] <- calculate_WAPE(test2$Weekly_Sales, yhat)
-}
-
-min(WAPEs_2) # smallest WAPE
-opt_params2 <- param_grid[which.min(WAPEs_2),]
-opt_params2 # optimal parameter set
-
-opt_param_list2 <- lapply(opt_params2, function(x) x)
-
-xgb2_opt <- xgboost(
-  data = train2X, label = train2Y, 
-  params = opt_param_list2, nthread = 10, 
-  nrounds = 200, early_stopping_rounds = 10,
-  objective = "reg:squarederror", verbose = 0
-)
-
-xgb.importance(model=xgb2_opt)
+xgb.importance(model=xgb_opt)
 ```
 
-### Comparison
-Based on the WAPEs, we can see that the XGBoost algorithm performed better on data set II, which contained the numeric week of the year (`isoweek`) but no information on lag or moving averages. The subset of predictors chosen by the models were also very different:
-
-- In data set I, the most important variable was `Fuel_Price`, followed closely by the moving average of 4 consecutive weekly sales. No single variable was significantly more important than the others.
-- In data set II, the variable `isoweek` was by far the most important, with a gain 4 times as much as the next most important predictor, `Temperature`.
-- In both data sets, the stores were the least important variables. This makes sense because we standardized the weekly sales by store before running the algorithm, so the effect of the store was not captured.
+The most important variable is `week`, followed by `lag1` and `lag4`. The stores were not imporant, which makes sense because we standardized the weekly sales by store before running the algorithm, so the effect of the store was not captured.
 
