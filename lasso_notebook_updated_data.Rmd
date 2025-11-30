@@ -335,7 +335,18 @@ cat("Test WAPE:", wape_test, "\n\n")
 
 coef(best_lasso_model)
 ```
+**Sort coeffs**
+```{r}
+coefs <- as.matrix(coef(best_lasso_model))[, 1]
+coefs_sorted <- sort(abs(coefs), decreasing = TRUE)
 
+# Print sorted coefficients with signs
+coef_df <- data.frame(
+  feature = names(coefs_sorted),
+  coef = coefs[names(coefs_sorted)]
+)
+coef_df
+```
 
 
 ###########################################################################################################
