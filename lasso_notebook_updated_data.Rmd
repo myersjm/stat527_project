@@ -288,33 +288,53 @@ coef(best_lasso_model)
 ```
 ### 5) LASSO WITH time-lagged features
 ```{r}
-colnames(train_df)
-```
-
-```{r}
+# colnames(train_df)
 # Define design matrix for this test.
-design_matrix_formula_baseline_lasso <- weekly_sales ~ holiday_flag + temperature + fuel_price + cpi + unemployment + 0 # 0 means no intercept, glmnet will add its own;
+design_matrix_formula_all_features <- weekly_sales ~ . - store - date + 0 # 0 means no intercept, glmnet will add its own;
 
 # Define lambda search grid--an easy way to get one with good scaling is from glmnet function itself:
 scaler <- scaler_fit(train_df, sales_cols_to_standardize)
 train_scaled <- scaler_transform(train_df, scaler)
-unused_X_all <- model.matrix(design_matrix_formula_baseline_lasso, data=train_scaled)
+unused_X_all <- model.matrix(design_matrix_formula_all_features, data=train_scaled)
 unused_y_all <- train_scaled$weekly_sales
 unused_model <- glmnet(unused_X_all, unused_y_all, alpha=1)
 lambda_grid <- unused_model$lambda
 lambda_grid
 ```
-
 #### a) cross val to select lambda
-
-#### b) final model with selected lambda
-
 ```{r}
-# Define design matrix pattern (to make it easier to form X's during cross val):
-design_matrix_formula <- weekly_sales_scaled ~ . - Store - Date - Weekly_Sales - sales_mean - sales_std + 0 # 0 means no intercept, glmnet will add its own; here we drop columns
-
+best_lambda <- lasso_cv(cv_folds, lambda_grid, design_matrix_formula_all_features)
 ```
 
+#### b) final model with selected lambda
+```{r}
+# Fit model with best lambda on full data, get test error:
+test_scaled <- scaler_transform(test_df, scaler)
+X_test <- model.matrix(design_matrix_formula_all_features, data=test_scaled)
+y_test_unscaled <- test_df$weekly_sales # not scaled
+
+X_train <- model.matrix(design_matrix_formula_all_features, data=train_scaled)
+y_train <- train_scaled$weekly_sales
+best_lasso_model <- glmnet(X_train, y_train, alpha=1, lambda=best_lambda)
+
+# Get val error:
+yhat_test <- predict(best_lasso_model, newx=X_test, s=best_lambda)
+
+# Un-scale: (need to build a small fake dataframe for this with store id)
+pred_df <- test_df %>% 
+  select(store) %>%
+  mutate(weekly_sales = yhat_test) # note that this does not actually modify test_df
+pred_df_unscaled <- scaler_inverse_column(pred_df, scaler, "weekly_sales")
+yhat_test_unscaled <- pred_df_unscaled$weekly_sales
+
+mse_test <- mean((y_test_unscaled - yhat_test_unscaled)^2)
+cat("Test MSE (unscaled): ", mse_test, "\n\n")
+
+wape_test <- sum(abs(y_test_unscaled - yhat_test_unscaled)) / sum(abs(y_test_unscaled))
+cat("Test WAPE:", wape_test, "\n\n")
+
+coef(best_lasso_model)
+```
 
 
 
