@@ -30,14 +30,12 @@ df <- df %>%
 head(df)
 ```
 
-Let's create a data set containing several different lags and moving averages for weekly sales.
 
-
-### Cross-Validation and Train/Test Split
+### Cross-Validation and Train/Validation Split
 
 We will perform 5-fold time series cross-validation to select the best hyperparameters. In each training set, we standardize any columns related to the sales, such as lags and moving averages, by store. This is to prevent stores with high weekly sales from dominating the variable selection process.
 
-We then scale these columns in each testing set using the corresponding mean and standard deviation of the training set.
+We then scale these columns in each validation set using the corresponding mean and standard deviation of the training set.
 
 ```{r}
 # function for standardizing training columns
@@ -69,7 +67,11 @@ scale_test_sales_columns <- function(df, col_vec, df_mean_sd) {
   
   df_new %>% select(-any_of(colnames(df_mean_sd)[-1]))
 }
+```
 
+With the creation of these two scaling functions, we can proceed with the train/validation split function for cross-validation. In fold $i$, data from the first $10\times(i+4)\%$ are used for training, and data from the following $10\%$ of weeks are used for validation, for $i=1,...,5.$
+
+```{r}
 # function to create data sets for time series CV
 train_test_cv <- function(df, std_vec, nfolds=5) {
   dat <- list()
@@ -137,8 +139,8 @@ library(xgboost)
 # initialize parameter grid
 param_grid <- expand.grid(
   max.depth = c(3, 6, 9),
-  eta = c(0.05, 0.1, 0.25, 0.5),
-  gamma = c(0, 0.25, 0.5),
+  eta = c(0.05, 0.1, 0.25),
+  gamma = c(0.1, 1, 5),
   subsample = c(0.5, 1),
   colsample_bytree = c(0.5, 1)
 )
@@ -153,12 +155,10 @@ nfolds <- 5 # 5 folds
 n_rounds <- 200 # max rounds per training instance
 n_earlystop <- 20 # early stopping rounds
 
-WAPEs <- numeric(nrow(param_grid)) # store the WAPE
+WAPEs <- matrix(0, nrow=nrow(param_grid), ncol=nfolds) # store the WAPE
 
 for(i in 1:nrow(param_grid)) {
   param_list <- lapply(param_grid[i,], function(x) x)
-  
-  WAPE_i <- numeric(nfolds)
   
   for(fold in seq(nfolds)) {
     fold_data <- cv_data[[fold]]
@@ -181,21 +181,54 @@ for(i in 1:nrow(param_grid)) {
     
     yhat <- joined_yhat$pred_denorm
     
-    WAPE_i[fold] <- calculate_WAPE(testYlab$weekly_sales, yhat)
+    WAPEs[i,fold] <- calculate_WAPE(testYlab$weekly_sales, yhat)
   }
-  
-  # store the WAPE
-  WAPEs[i] <- mean(WAPE_i)
 }
 
-min(WAPEs) # smallest WAPE
-opt_params <- param_grid[which.min(WAPEs),]
+WAPE_means <- rowMeans(WAPEs)
+
+min(WAPE_means) # smallest WAPE
+opt_params <- param_grid[which.min(WAPE_means),]
 opt_params # optimal parameter set
 ```
 
-After obtaining the optimal hyperparameters from the grid search, we can train a final XGBoost model with them, using the final fold.
+### Final Train/Test Split
+
+After obtaining the optimal hyperparameters from the grid search, we can train a final XGBoost model with them, using data from the first 80% of the weeks to train, and the remaining 20% to test. The resulting WAPE from the test data will be compared against other models.
 
 ```{r}
+# final train/test split
+all_dates <- unique(df$date) # already sorted
+cutoff_ix <- floor(0.8 * length(all_dates))
+cutoff_date <- all_dates[cutoff_ix]
+
+train_df <- df %>% filter(date <= cutoff_date)
+test_df  <- df %>% filter(date >  cutoff_date)
+
+# standardize the training columns
+std_cols <- standardize_sales_columns(train_df, std_vec)
+train_std <- std_cols$df_new
+train_stats <- std_cols$df_mean_sd
+
+# scale the test columns, excluding the response
+std_vec1 <- std_vec[std_vec != "weekly_sales"]
+test_std <- scale_test_sales_columns(test_df, std_vec1, train_stats)
+
+resp_stats <- train_stats %>% 
+  select(store, weekly_sales_mean, weekly_sales_sd)
+
+trainX <- model.matrix(weekly_sales ~ ., train_std)
+testX <- model.matrix(weekly_sales ~ ., test_std)
+
+trainY <- train_std$weekly_sales 
+testYlab <- test_std %>% select(store, weekly_sales)
+```
+
+We are ready to train and test the model.
+
+```{r}
+set.seed(2)
+
 opt_param_list <- lapply(opt_params, function(x) x)
 
 xgb_opt <- xgboost(
@@ -204,7 +237,16 @@ xgb_opt <- xgboost(
   nrounds = n_rounds, early_stopping_rounds = n_earlystop,
   objective = "reg:squarederror", verbose = 0
 )
+
+pred <- predict(xgb_opt, testX)
+joined_yhat <- testYlab %>% left_join(y_mean_sd, by = "store") %>%
+  mutate(pred_denorm = (pred * weekly_sales_sd) + weekly_sales_mean)
+
+yhat <- joined_yhat$pred_denorm
+  
+calculate_WAPE(testYlab$weekly_sales, yhat)
 ```
+
 
 ### Variable Importance
 
@@ -212,5 +254,5 @@ xgb_opt <- xgboost(
 xgb.importance(model=xgb_opt)
 ```
 
-The most important variable is `week`, followed by `lag1` and `lag4`. The stores were not imporant, which makes sense because we standardized the weekly sales by store before running the algorithm, so the effect of the store was not captured.
+The most important variable by far is `week`, followed by `lag4` and `lag1`. The stores were not imporant, which makes sense because we standardized the weekly sales by store before running the algorithm, so the effect of the store was not captured.
 
