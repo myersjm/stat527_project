@@ -1,8 +1,7 @@
 ---
 title: "ARIMA-Walmart"
 output:
-  html_document:
-    df_print: paged
+  html_notebook: default
 ---
 
 ```{r}
@@ -16,7 +15,7 @@ theme_set(theme_minimal())
 
 # 1) load data
 ```{r}
-df <- read_csv("data/walmart_features.csv")
+df <- read_csv("walmart_features.csv")
 
 head(df)
 sapply(df, class)
@@ -114,6 +113,32 @@ calculate_WAPE <- function(y, yhat) {
 }
 ```
 
+```{r}
+# --- Global train / test split: last 20% weeks as test -----------------
+
+all_dates <- sort(unique(df$date))
+n_dates   <- length(all_dates)
+n_test    <- ceiling(0.2 * n_dates)
+
+test_start_date <- all_dates[n_dates - n_test + 1]
+
+df_train <- df %>% filter(date <  test_start_date)
+df_test  <- df %>% filter(date >= test_start_date)
+
+# sanity check
+length(unique(df$date))      # total weeks
+length(unique(df_train$date))  # train weeks
+length(unique(df_test$date))   # test weeks
+
+# Fit scaler on *training* data only
+scaler_global <- scaler_fit(df_train, sales_cols_to_standardize)
+
+df_train_scaled <- scaler_transform(df_train, scaler_global)
+df_test_scaled  <- scaler_transform(df_test,  scaler_global)
+
+```
+
+
 # 4) time series CV folds
 ```{r}
 train_test_cv_arima <- function(df, sales_cols, nfolds = 5) {
@@ -148,7 +173,8 @@ train_test_cv_arima <- function(df, sales_cols, nfolds = 5) {
   folds
 }
 
-cv_folds <- train_test_cv_arima(df, sales_cols_to_standardize, nfolds = 5)
+cv_folds <- train_test_cv_arima(df_train, sales_cols_to_standardize, nfolds = 5)
+
 length(cv_folds)
 ```
 
@@ -243,9 +269,85 @@ WAPEs_cv_arima
 ```
 
 ```{r}
+# --- ARIMA final test WAPE on held-out last 20% weeks ------------------
+
+stores <- sort(unique(df_train_scaled$store))
+
+pred_list_test_arima <- vector("list", length(stores))
+names(pred_list_test_arima) <- as.character(stores)
+
+for (i in seq_along(stores)) {
+  s <- stores[i]
+  # 打印进度，防止你以为死机了
+  message("Fitting ARIMA for store ", s, " (", i, "/", length(stores), ")")
+
+  train_s <- df_train_scaled %>%
+    filter(store == s) %>%
+    arrange(date)
+  test_s  <- df_test_scaled %>%
+    filter(store == s) %>%
+    arrange(date)
+
+  if (nrow(test_s) == 0) next
+
+  y_train <- train_s$weekly_sales
+  y_ts    <- ts(y_train, frequency = 52)
+
+  # 为了加速，这里用 auto.arima 默认配置（stepwise=TRUE）
+  fit_s <- auto.arima(
+    y_ts,
+    seasonal = TRUE
+  )
+
+  h    <- nrow(test_s)
+  fc_s <- forecast(fit_s, h = h)
+
+  pred_list_test_arima[[as.character(s)]] <- tibble(
+    store        = s,
+    date         = test_s$date,
+    weekly_sales = as.numeric(fc_s$mean)
+  )
+}
+
+# 显式去掉 NULL，再 bind_rows，避免 bind_rows 处理大量 NULL
+non_empty <- !sapply(pred_list_test_arima, is.null)
+pred_list_test_arima <- pred_list_test_arima[non_empty]
+
+if (length(pred_list_test_arima) == 0) {
+  test_WAPE_arima <- NA_real_
+} else {
+  pred_scaled_test_arima <- bind_rows(pred_list_test_arima)
+
+  pred_unscaled_test_arima <- scaler_inverse_column(
+    df     = pred_scaled_test_arima,
+    scaler = scaler_global,
+    col    = "weekly_sales"
+  ) %>%
+    rename(yhat = weekly_sales)
+
+  test_actual <- df_test %>%
+    select(store, date, weekly_sales)
+
+  results_test_arima <- test_actual %>%
+    left_join(pred_unscaled_test_arima, by = c("store", "date"))
+
+  test_WAPE_arima <- calculate_WAPE(
+    results_test_arima$weekly_sales,
+    results_test_arima$yhat
+  )
+}
+
+test_WAPE_arima
+
+
+```
+
+```{r}
 cv_WAPE_arima_mean <- mean(WAPEs_cv_arima, na.rm = TRUE)
 cat("ARIMA CV WAPE (mean over folds):", cv_WAPE_arima_mean, "\n")
 ```
+
+
 
 # 6) ARIMAX 
 ```{r}
@@ -377,46 +479,185 @@ WAPEs_cv_arimax
 
 
 ```{r}
+# --- ARIMAX final test WAPE on held-out last 20% weeks -----------------
+
+stores <- sort(unique(df_train_scaled$store))
+
+pred_list_test_arimax <- vector("list", length(stores))
+names(pred_list_test_arimax) <- as.character(stores)
+
+for (i in seq_along(stores)) {
+  s <- stores[i]
+  message("Fitting ARIMAX for store ", s, " (", i, "/", length(stores), ")")
+
+  train_s <- df_train_scaled %>%
+    filter(store == s) %>%
+    arrange(date)
+  test_s  <- df_test_scaled %>%
+    filter(store == s) %>%
+    arrange(date)
+
+  if (nrow(test_s) == 0) next
+
+  y_train <- train_s$weekly_sales
+  y_ts    <- ts(y_train, frequency = 52)
+
+  # --- 构造 xreg: 在 train+test 上做 model.matrix，然后切开 -----------------
+  comb   <- bind_rows(train_s, test_s)
+  mm_all <- model.matrix(
+    ~ . - store - date - weekly_sales,
+    data = comb
+  )
+
+  n_tr       <- nrow(train_s)
+  xreg_train <- mm_all[seq_len(n_tr), , drop = FALSE]
+  xreg_test  <- mm_all[(n_tr + 1):nrow(mm_all), , drop = FALSE]
+
+  # 去掉方差为 0 的列（避免奇异与多重共线）
+  if (ncol(xreg_train) > 0) {
+    keep <- apply(xreg_train, 2, function(z) sd(z, na.rm = TRUE) > 0)
+    if (any(keep)) {
+      xreg_train <- xreg_train[, keep, drop = FALSE]
+      xreg_test  <- xreg_test[,  keep, drop = FALSE]
+    } else {
+      xreg_train <- NULL
+      xreg_test  <- NULL
+    }
+  } else {
+    xreg_train <- NULL
+    xreg_test  <- NULL
+  }
+
+  # --- 拟合 ARIMAX（或退化成 ARIMA） --------------------------------------
+  fit_s <- tryCatch(
+    {
+      if (!is.null(xreg_train)) {
+        auto.arima(
+          y_ts,
+          xreg     = xreg_train,
+          seasonal = TRUE
+        )
+      } else {
+        auto.arima(
+          y_ts,
+          seasonal = TRUE
+        )
+      }
+    },
+    error = function(e) {
+      # 出错时退回到不带 xreg 的 ARIMA
+      auto.arima(
+        y_ts,
+        seasonal = TRUE
+      )
+    }
+  )
+
+  # 判断 forecast 时是否还需要 xreg
+  use_xreg <- (!is.null(xreg_test)) && ("xreg" %in% names(fit_s$call))
+
+  fc_s <- tryCatch(
+    {
+      if (use_xreg) {
+        forecast(fit_s, xreg = xreg_test)
+      } else {
+        forecast(fit_s, h = nrow(test_s))
+      }
+    },
+    error = function(e) {
+      forecast(fit_s, h = nrow(test_s))
+    }
+  )
+
+  pred_list_test_arimax[[as.character(s)]] <- tibble(
+    store        = s,
+    date         = test_s$date,
+    weekly_sales = as.numeric(fc_s$mean)
+  )
+}
+
+# --- 只保留非空元素，再 bind_rows -----------------------------------------
+
+non_empty <- !sapply(pred_list_test_arimax, is.null)
+pred_list_test_arimax <- pred_list_test_arimax[non_empty]
+
+if (length(pred_list_test_arimax) == 0) {
+  test_WAPE_arimax <- NA_real_
+} else {
+  pred_scaled_test_arimax <- bind_rows(pred_list_test_arimax)
+
+  pred_unscaled_test_arimax <- scaler_inverse_column(
+    df     = pred_scaled_test_arimax,
+    scaler = scaler_global,
+    col    = "weekly_sales"
+  ) %>%
+    rename(yhat = weekly_sales)
+
+  test_actual <- df_test %>%
+    select(store, date, weekly_sales)
+
+  results_test_arimax <- test_actual %>%
+    left_join(pred_unscaled_test_arimax, by = c("store", "date"))
+
+  test_WAPE_arimax <- calculate_WAPE(
+    results_test_arimax$weekly_sales,
+    results_test_arimax$yhat
+  )
+}
+
+test_WAPE_arimax
+
+```
+
+```{r}
 cv_WAPE_arimax_mean <- mean(WAPEs_cv_arimax, na.rm = TRUE)
 cat("ARIMAX CV WAPE (mean over folds):", cv_WAPE_arimax_mean, "\n")
 ```
 
 
+
 # 7) Summary
 ```{r}
 tibble(
-  model = c("ARIMA", "ARIMAX"),
-  cv_WAPE_mean = c(cv_WAPE_arima_mean, cv_WAPE_arimax_mean)
+  model        = c("ARIMA", "ARIMAX"),
+  cv_WAPE_mean = c(cv_WAPE_arima_mean,  cv_WAPE_arimax_mean),
+  test_WAPE    = c(test_WAPE_arima,     test_WAPE_arimax)
 )
+
 ```
 
 # 8)ARIMAX coefficient-based variable importance
 
 ```{r}
+stores <- sort(unique(df_train_scaled$store))
+
 arimax_imp_list <- vector("list", length(stores))
 names(arimax_imp_list) <- as.character(stores)
 
-for (s in stores) {
-  train_s <- train_scaled %>%
+for (i in seq_along(stores)) {
+  s <- stores[i]
+  message("Fitting ARIMAX (importance) for store ", s, " (", i, "/", length(stores), ")")
+
+  train_s <- df_train_scaled %>%   
     filter(store == s) %>%
     arrange(date)
-  
+
   if (nrow(train_s) < 40) next
-  
+
   y_train <- train_s$weekly_sales
-  y_ts <- ts(y_train, frequency = 52)
-  
+  y_ts    <- ts(y_train, frequency = 52)
+
   xreg_train <- model.matrix(
     ~ . - store - date - weekly_sales,
     data = train_s
   )
-  
+
   if (ncol(xreg_train) == 0) next
-  
+
   keep <- apply(xreg_train, 2, function(z) sd(z, na.rm = TRUE) > 0)
   if (!any(keep)) next
   xreg_train <- xreg_train[, keep, drop = FALSE]
-  
+
   fit_s <- tryCatch(
     auto.arima(
       y_ts,
@@ -427,13 +668,13 @@ for (s in stores) {
     ),
     error = function(e) NULL
   )
-  
+
   if (is.null(fit_s)) next
-  
-  coefs <- coef(fit_s)
+
+  coefs      <- coef(fit_s)
   beta_names <- intersect(names(coefs), colnames(xreg_train))
   if (length(beta_names) == 0) next
-  
+
   arimax_imp_list[[as.character(s)]] <- tibble(
     store   = s,
     feature = beta_names,
@@ -441,10 +682,12 @@ for (s in stores) {
   )
 }
 
-arimax_importance <- bind_rows(arimax_imp_list)
+non_empty <- !sapply(arimax_imp_list, is.null)
+arimax_importance <- bind_rows(arimax_imp_list[non_empty])
 
 dim(arimax_importance)
 head(arimax_importance)
+
 
 ```
 
@@ -476,9 +719,7 @@ ggplot(importance_summary %>% slice_max(mean_abs_beta, n = top_k),
 
 ```
 
-```{r}
-importance_summary
-```
+
 
 
 
