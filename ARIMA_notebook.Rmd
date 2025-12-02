@@ -114,7 +114,6 @@ calculate_WAPE <- function(y, yhat) {
 ```
 
 ```{r}
-# --- Global train / test split: last 20% weeks as test -----------------
 
 all_dates <- sort(unique(df$date))
 n_dates   <- length(all_dates)
@@ -125,12 +124,10 @@ test_start_date <- all_dates[n_dates - n_test + 1]
 df_train <- df %>% filter(date <  test_start_date)
 df_test  <- df %>% filter(date >= test_start_date)
 
-# sanity check
-length(unique(df$date))      # total weeks
-length(unique(df_train$date))  # train weeks
-length(unique(df_test$date))   # test weeks
+length(unique(df$date))     
+length(unique(df_train$date))  
+length(unique(df_test$date))  
 
-# Fit scaler on *training* data only
 scaler_global <- scaler_fit(df_train, sales_cols_to_standardize)
 
 df_train_scaled <- scaler_transform(df_train, scaler_global)
@@ -269,7 +266,6 @@ WAPEs_cv_arima
 ```
 
 ```{r}
-# --- ARIMA final test WAPE on held-out last 20% weeks ------------------
 
 stores <- sort(unique(df_train_scaled$store))
 
@@ -278,8 +274,7 @@ names(pred_list_test_arima) <- as.character(stores)
 
 for (i in seq_along(stores)) {
   s <- stores[i]
-  # 打印进度，防止你以为死机了
-  message("Fitting ARIMA for store ", s, " (", i, "/", length(stores), ")")
+  # message("Fitting ARIMA for store ", s, " (", i, "/", length(stores), ")")
 
   train_s <- df_train_scaled %>%
     filter(store == s) %>%
@@ -293,7 +288,6 @@ for (i in seq_along(stores)) {
   y_train <- train_s$weekly_sales
   y_ts    <- ts(y_train, frequency = 52)
 
-  # 为了加速，这里用 auto.arima 默认配置（stepwise=TRUE）
   fit_s <- auto.arima(
     y_ts,
     seasonal = TRUE
@@ -309,7 +303,6 @@ for (i in seq_along(stores)) {
   )
 }
 
-# 显式去掉 NULL，再 bind_rows，避免 bind_rows 处理大量 NULL
 non_empty <- !sapply(pred_list_test_arima, is.null)
 pred_list_test_arima <- pred_list_test_arima[non_empty]
 
@@ -479,7 +472,6 @@ WAPEs_cv_arimax
 
 
 ```{r}
-# --- ARIMAX final test WAPE on held-out last 20% weeks -----------------
 
 stores <- sort(unique(df_train_scaled$store))
 
@@ -488,7 +480,7 @@ names(pred_list_test_arimax) <- as.character(stores)
 
 for (i in seq_along(stores)) {
   s <- stores[i]
-  message("Fitting ARIMAX for store ", s, " (", i, "/", length(stores), ")")
+  # message("Fitting ARIMAX for store ", s, " (", i, "/", length(stores), ")")
 
   train_s <- df_train_scaled %>%
     filter(store == s) %>%
@@ -502,7 +494,6 @@ for (i in seq_along(stores)) {
   y_train <- train_s$weekly_sales
   y_ts    <- ts(y_train, frequency = 52)
 
-  # --- 构造 xreg: 在 train+test 上做 model.matrix，然后切开 -----------------
   comb   <- bind_rows(train_s, test_s)
   mm_all <- model.matrix(
     ~ . - store - date - weekly_sales,
@@ -513,7 +504,6 @@ for (i in seq_along(stores)) {
   xreg_train <- mm_all[seq_len(n_tr), , drop = FALSE]
   xreg_test  <- mm_all[(n_tr + 1):nrow(mm_all), , drop = FALSE]
 
-  # 去掉方差为 0 的列（避免奇异与多重共线）
   if (ncol(xreg_train) > 0) {
     keep <- apply(xreg_train, 2, function(z) sd(z, na.rm = TRUE) > 0)
     if (any(keep)) {
@@ -528,7 +518,6 @@ for (i in seq_along(stores)) {
     xreg_test  <- NULL
   }
 
-  # --- 拟合 ARIMAX（或退化成 ARIMA） --------------------------------------
   fit_s <- tryCatch(
     {
       if (!is.null(xreg_train)) {
@@ -545,7 +534,6 @@ for (i in seq_along(stores)) {
       }
     },
     error = function(e) {
-      # 出错时退回到不带 xreg 的 ARIMA
       auto.arima(
         y_ts,
         seasonal = TRUE
@@ -553,7 +541,6 @@ for (i in seq_along(stores)) {
     }
   )
 
-  # 判断 forecast 时是否还需要 xreg
   use_xreg <- (!is.null(xreg_test)) && ("xreg" %in% names(fit_s$call))
 
   fc_s <- tryCatch(
@@ -576,7 +563,6 @@ for (i in seq_along(stores)) {
   )
 }
 
-# --- 只保留非空元素，再 bind_rows -----------------------------------------
 
 non_empty <- !sapply(pred_list_test_arimax, is.null)
 pred_list_test_arimax <- pred_list_test_arimax[non_empty]
@@ -636,7 +622,7 @@ names(arimax_imp_list) <- as.character(stores)
 
 for (i in seq_along(stores)) {
   s <- stores[i]
-  message("Fitting ARIMAX (importance) for store ", s, " (", i, "/", length(stores), ")")
+  # message("Fitting ARIMAX (importance) for store ", s, " (", i, "/", length(stores), ")")
 
   train_s <- df_train_scaled %>%   
     filter(store == s) %>%
