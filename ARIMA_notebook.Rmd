@@ -1,0 +1,491 @@
+---
+title: "ARIMA-Walmart"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+library(tidyverse)
+library(readr)
+library(dplyr)
+library(forecast)
+
+theme_set(theme_minimal())
+```
+
+# 1) load data
+```{r}
+df <- read_csv("data/walmart_features.csv")
+
+head(df)
+sapply(df, class)
+```
+
+# 2)basic preprocessing
+```{r}
+df <- df %>%
+  mutate(
+    store = as.factor(store),
+    holiday_flag = factor(holiday_flag, levels = unique(holiday_flag))
+  ) %>%
+  arrange(date, store) %>%
+  select(-is_holiday_num)
+
+head(df)
+dim(df)
+length(unique(df$store))
+length(unique(df$date))
+
+```
+```{r}
+total_ts <- df %>%
+  group_by(date) %>%
+  summarise(total_sales = sum(weekly_sales), .groups = "drop")
+
+ggplot(total_ts, aes(x = date, y = total_sales)) +
+  geom_line() +
+  labs(
+    title = "Total Weekly Sales",
+    x = "Date",
+    y = "Total Weekly Sales"
+  )
+
+```
+
+# 3)standardization utilities
+```{r}
+scaler_fit <- function(df, cols_to_standardize) {
+  stats <- df %>%
+    group_by(store) %>%
+    summarise(
+      across(
+        all_of(cols_to_standardize),
+        list(
+          mean = ~mean(.x, na.rm = TRUE),
+          sd   = ~sd(.x,   na.rm = TRUE)
+        )
+      ),
+      .groups = "drop"
+    )
+  list(
+    stats = stats,
+    cols  = cols_to_standardize
+  )
+}
+
+scaler_transform <- function(df, scaler, cols = scaler$cols) {
+  stats <- scaler$stats
+  df2 <- df %>% left_join(stats, by = "store")
+  for (col in cols) {
+    mean_col <- paste0(col, "_mean")
+    sd_col   <- paste0(col, "_sd")
+    df2[[col]] <- (df2[[col]] - df2[[mean_col]]) / df2[[sd_col]]
+  }
+  df2 %>% select(-ends_with("_mean"), -ends_with("_sd"))
+}
+
+scaler_inverse_column <- function(df, scaler, col) {
+  stats <- scaler$stats
+  stats_small <- stats %>%
+    select(
+      store,
+      paste0(col, "_mean"),
+      paste0(col, "_sd")
+    )
+  df2 <- df %>% left_join(stats_small, by = "store")
+  mean_col <- paste0(col, "_mean")
+  sd_col   <- paste0(col, "_sd")
+  df2[[col]] <- df2[[col]] * df2[[sd_col]] + df2[[mean_col]]
+  df2 %>% select(-ends_with("_mean"), -ends_with("_sd"))
+}
+
+sales_cols_to_standardize <- c(
+  "weekly_sales",
+  "lag1", "lag2", "lag4", "lag8",
+  "ma4", "ma8",
+  "store_mean_to_prev", "store_sd_to_prev",
+  "inter_holiday_lag1"
+)
+
+calculate_WAPE <- function(y, yhat) {
+  sum(abs(y - yhat), na.rm = TRUE) /
+    sum(abs(y),       na.rm = TRUE)
+}
+```
+
+# 4) time series CV folds
+```{r}
+train_test_cv_arima <- function(df, sales_cols, nfolds = 5) {
+  dates <- sort(unique(df$date))
+  nweeks <- length(dates)
+  test_len <- ceiling(nweeks / (2 * nfolds))
+  idx <- nweeks - c(nfolds:1) * test_len
+  
+  folds <- vector("list", nfolds)
+  
+  for (fold in seq_len(nfolds)) {
+    train_idx <- idx[fold]
+    test_idx  <- min(idx[fold] + test_len, nweeks)
+    
+    train_raw <- df %>% filter(date <= dates[train_idx])
+    test_raw  <- df %>% filter(date > dates[train_idx],
+                               date <= dates[test_idx])
+    
+    scaler_fold <- scaler_fit(train_raw, sales_cols)
+    train_scaled_fold <- scaler_transform(train_raw, scaler_fold)
+    test_scaled_fold  <- scaler_transform(test_raw,  scaler_fold)
+    
+    folds[[fold]] <- list(
+      train_raw      = train_raw,
+      test_raw       = test_raw,
+      train_scaled   = train_scaled_fold,
+      test_scaled    = test_scaled_fold,
+      scaler         = scaler_fold
+    )
+  }
+  
+  folds
+}
+
+cv_folds <- train_test_cv_arima(df, sales_cols_to_standardize, nfolds = 5)
+length(cv_folds)
+```
+
+```{r}
+fold_ranges <- purrr::map_dfr(seq_along(cv_folds), function(k) {
+  tr <- cv_folds[[k]]$train_raw
+  te <- cv_folds[[k]]$test_raw
+  tibble(
+    fold = k,
+    train_start = min(tr$date),
+    train_end   = max(tr$date),
+    test_start  = min(te$date),
+    test_end    = max(te$date)
+  )
+})
+
+fold_ranges
+```
+
+# 5) ARIMA time-series CV WAPE
+```{r}
+stores <- sort(unique(df$store))
+nfolds <- length(cv_folds)
+
+WAPEs_cv_arima <- numeric(nfolds)
+
+for (k in seq_len(nfolds)) {
+  fold <- cv_folds[[k]]
+  train_fold_scaled <- fold$train_scaled
+  test_fold_scaled  <- fold$test_scaled
+  test_fold_raw     <- fold$test_raw
+  scaler_fold       <- fold$scaler
+  
+  stores_fold <- sort(unique(train_fold_scaled$store))
+  pred_list_fold <- vector("list", length(stores_fold))
+  names(pred_list_fold) <- as.character(stores_fold)
+  
+  for (s in stores_fold) {
+    train_s <- train_fold_scaled %>%
+      filter(store == s) %>%
+      arrange(date)
+    test_s <- test_fold_scaled %>%
+      filter(store == s) %>%
+      arrange(date)
+    
+    if (nrow(test_s) == 0) next
+    
+    y_train <- train_s$weekly_sales
+    y_ts <- ts(y_train, frequency = 52)
+    
+    fit_s <- auto.arima(
+      y_ts,
+      seasonal      = TRUE,
+      stepwise      = FALSE,
+      approximation = FALSE
+    )
+    
+    h <- nrow(test_s)
+    fc_s <- forecast(fit_s, h = h)
+    
+    pred_list_fold[[as.character(s)]] <- tibble(
+      store        = s,
+      date         = test_s$date,
+      weekly_sales = as.numeric(fc_s$mean)
+    )
+  }
+  
+  pred_scaled_fold <- bind_rows(pred_list_fold)
+  
+  if (nrow(pred_scaled_fold) == 0) {
+    WAPEs_cv_arima[k] <- NA
+  } else {
+    pred_unscaled_fold <- scaler_inverse_column(
+      df     = pred_scaled_fold,
+      scaler = scaler_fold,
+      col    = "weekly_sales"
+    ) %>%
+      rename(yhat = weekly_sales)
+    
+    test_actual_fold <- test_fold_raw %>%
+      select(store, date, weekly_sales)
+    
+    results_fold <- test_actual_fold %>%
+      left_join(pred_unscaled_fold, by = c("store", "date"))
+    
+    WAPEs_cv_arima[k] <- calculate_WAPE(results_fold$weekly_sales,
+                                        results_fold$yhat)
+  }
+}
+
+WAPEs_cv_arima
+```
+
+```{r}
+cv_WAPE_arima_mean <- mean(WAPEs_cv_arima, na.rm = TRUE)
+cat("ARIMA CV WAPE (mean over folds):", cv_WAPE_arima_mean, "\n")
+```
+
+# 6) ARIMAX 
+```{r}
+WAPEs_cv_arimax <- numeric(nfolds)
+
+for (k in seq_len(nfolds)) {
+  fold <- cv_folds[[k]]
+  train_fold_scaled <- fold$train_scaled
+  test_fold_scaled  <- fold$test_scaled
+  test_fold_raw     <- fold$test_raw
+  scaler_fold       <- fold$scaler
+  
+  stores_fold <- sort(unique(train_fold_scaled$store))
+  pred_list_fold <- vector("list", length(stores_fold))
+  names(pred_list_fold) <- as.character(stores_fold)
+  
+  for (s in stores_fold) {
+    train_s <- train_fold_scaled %>%
+      filter(store == s) %>%
+      arrange(date)
+    test_s <- test_fold_scaled %>%
+      filter(store == s) %>%
+      arrange(date)
+    
+    if (nrow(test_s) == 0) next
+    
+    y_train <- train_s$weekly_sales
+    y_ts <- ts(y_train, frequency = 52)
+    
+    comb   <- bind_rows(train_s, test_s)
+    mm_all <- model.matrix(
+      ~ . - store - date - weekly_sales,
+      data = comb
+    )
+    n_tr <- nrow(train_s)
+    xreg_train <- mm_all[seq_len(n_tr), , drop = FALSE]
+    xreg_test  <- mm_all[(n_tr + 1):nrow(mm_all), , drop = FALSE]
+    
+    if (ncol(xreg_train) > 0) {
+      keep <- apply(xreg_train, 2, function(z) sd(z, na.rm = TRUE) > 0)
+      if (any(keep)) {
+        xreg_train <- xreg_train[, keep, drop = FALSE]
+        xreg_test  <- xreg_test[,  keep, drop = FALSE]
+      } else {
+        xreg_train <- NULL
+        xreg_test  <- NULL
+      }
+    } else {
+      xreg_train <- NULL
+      xreg_test  <- NULL
+    }
+    
+    fit_s <- tryCatch(
+      {
+        if (!is.null(xreg_train)) {
+          auto.arima(
+            y_ts,
+            xreg          = xreg_train,
+            seasonal      = TRUE,
+            stepwise      = TRUE,
+            approximation = TRUE
+          )
+        } else {
+          auto.arima(
+            y_ts,
+            seasonal      = TRUE,
+            stepwise      = TRUE,
+            approximation = TRUE
+          )
+        }
+      },
+      error = function(e) {
+        auto.arima(
+          y_ts,
+          seasonal      = TRUE,
+          stepwise      = TRUE,
+          approximation = TRUE
+        )
+      }
+    )
+    
+    use_xreg <- ("xreg" %in% names(fit_s$call)) && !is.null(xreg_test)
+    
+    fc_s <- tryCatch(
+      {
+        if (use_xreg) {
+          forecast(fit_s, xreg = xreg_test)
+        } else {
+          forecast(fit_s, h = nrow(test_s))
+        }
+      },
+      error = function(e) {
+        forecast(fit_s, h = nrow(test_s))
+      }
+    )
+    
+    pred_list_fold[[as.character(s)]] <- tibble(
+      store        = s,
+      date         = test_s$date,
+      weekly_sales = as.numeric(fc_s$mean)
+    )
+  }
+  
+  pred_scaled_fold <- bind_rows(pred_list_fold)
+  
+  if (nrow(pred_scaled_fold) == 0) {
+    WAPEs_cv_arimax[k] <- NA
+  } else {
+    pred_unscaled_fold <- scaler_inverse_column(
+      df     = pred_scaled_fold,
+      scaler = scaler_fold,
+      col    = "weekly_sales"
+    ) %>%
+      rename(yhat = weekly_sales)
+    
+    test_actual_fold <- test_fold_raw %>%
+      select(store, date, weekly_sales)
+    
+    results_fold <- test_actual_fold %>%
+      left_join(pred_unscaled_fold, by = c("store", "date"))
+    
+    WAPEs_cv_arimax[k] <- calculate_WAPE(results_fold$weekly_sales,
+                                         results_fold$yhat)
+  }
+}
+
+WAPEs_cv_arimax
+```
+
+
+```{r}
+cv_WAPE_arimax_mean <- mean(WAPEs_cv_arimax, na.rm = TRUE)
+cat("ARIMAX CV WAPE (mean over folds):", cv_WAPE_arimax_mean, "\n")
+```
+
+
+# 7) Summary
+```{r}
+tibble(
+  model = c("ARIMA", "ARIMAX"),
+  cv_WAPE_mean = c(cv_WAPE_arima_mean, cv_WAPE_arimax_mean)
+)
+```
+
+# 8)ARIMAX coefficient-based variable importance
+
+```{r}
+arimax_imp_list <- vector("list", length(stores))
+names(arimax_imp_list) <- as.character(stores)
+
+for (s in stores) {
+  train_s <- train_scaled %>%
+    filter(store == s) %>%
+    arrange(date)
+  
+  if (nrow(train_s) < 40) next
+  
+  y_train <- train_s$weekly_sales
+  y_ts <- ts(y_train, frequency = 52)
+  
+  xreg_train <- model.matrix(
+    ~ . - store - date - weekly_sales,
+    data = train_s
+  )
+  
+  if (ncol(xreg_train) == 0) next
+  
+  keep <- apply(xreg_train, 2, function(z) sd(z, na.rm = TRUE) > 0)
+  if (!any(keep)) next
+  xreg_train <- xreg_train[, keep, drop = FALSE]
+  
+  fit_s <- tryCatch(
+    auto.arima(
+      y_ts,
+      xreg          = xreg_train,
+      seasonal      = TRUE,
+      stepwise      = TRUE,
+      approximation = TRUE
+    ),
+    error = function(e) NULL
+  )
+  
+  if (is.null(fit_s)) next
+  
+  coefs <- coef(fit_s)
+  beta_names <- intersect(names(coefs), colnames(xreg_train))
+  if (length(beta_names) == 0) next
+  
+  arimax_imp_list[[as.character(s)]] <- tibble(
+    store   = s,
+    feature = beta_names,
+    beta    = as.numeric(coefs[beta_names])
+  )
+}
+
+arimax_importance <- bind_rows(arimax_imp_list)
+
+dim(arimax_importance)
+head(arimax_importance)
+
+```
+
+```{r}
+importance_summary <- arimax_importance %>%
+  group_by(feature) %>%
+  summarise(
+    mean_abs_beta = mean(abs(beta), na.rm = TRUE),
+    n_stores      = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_abs_beta))
+
+head(importance_summary, 15)
+```
+
+```{r}
+top_k <- 15
+
+ggplot(importance_summary %>% slice_max(mean_abs_beta, n = top_k),
+       aes(x = reorder(feature, mean_abs_beta), y = mean_abs_beta)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "ARIMAX coefficient-based feature importance (training period)",
+    x = "Feature (model.matrix columns)",
+    y = "Mean |beta| across stores"
+  )
+
+```
+
+```{r}
+importance_summary
+```
+
+
+
+
+
+
+
+
+
+
