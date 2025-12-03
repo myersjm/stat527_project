@@ -71,7 +71,7 @@ scale_test_sales_columns <- function(df, col_vec, df_mean_sd) {
 
 With the creation of these two scaling functions, we can proceed with the train/validation split function for cross-validation. In fold $i$, data from the first $10\times(i+4)\%$ are used for training, and data from the following $10\%$ of weeks are used for validation, for $i=1,...,5.$
 
-```{r}
+```{r, warning=FALSE}
 # function to create data sets for time series CV
 train_test_cv <- function(df, std_vec, nfolds=5) {
   dat <- list()
@@ -131,7 +131,7 @@ cv_data <- train_test_cv(df, std_vec)
 ### XGBoost
 Let's fit an XGBoost on this data sets, using time series cross-validation with a grid search to find optimal hyperparameters. We use the WAPE (weighted absolute percentage error) metric to determine the best hyperparameters and compare models.
 
-```{r}
+```{r, warning=FALSE}
 set.seed(0)
 
 library(xgboost)
@@ -153,7 +153,6 @@ calculate_WAPE <- function(y, yhat) {
 nfolds <- 5 # 5 folds
 
 n_rounds <- 200 # max rounds per training instance
-n_earlystop <- 20 # early stopping rounds
 
 WAPEs <- matrix(0, nrow=nrow(param_grid), ncol=nfolds) # store the WAPE
 
@@ -169,8 +168,8 @@ for(i in 1:nrow(param_grid)) {
     
     xgb1 <- xgboost(
       data = trainX, label = trainY, 
-      params = param_list, nthread = 10, 
-      nrounds = n_rounds, early_stopping_rounds = n_earlystop,
+      params = param_list, nthread = 0, 
+      nrounds = n_rounds,
       objective = "reg:squarederror", verbose = 0
     )
     
@@ -227,7 +226,7 @@ testYlab <- test_std %>% select(store, weekly_sales)
 We are ready to train and test the model.
 
 ```{r}
-set.seed(2)
+set.seed(5)
 
 opt_param_list <- lapply(opt_params, function(x) x)
 
@@ -251,8 +250,13 @@ calculate_WAPE(testYlab$weekly_sales, yhat)
 ### Variable Importance
 
 ```{r}
-xgb.importance(model=xgb_opt)
+importance <- xgb.importance(model=xgb_opt)
+importance
+
+xgb.plot.importance(importance, top_n=10, cex=0.7)
 ```
 
-The most important variable by far is `week`, followed by `lag4` and `lag1`. The stores were not imporant, which makes sense because we standardized the weekly sales by store before running the algorithm, so the effect of the store was not captured.
+The most important variable is `week`, followed by `lag4` and `lag1`. The stores were not imporant, which makes sense because we standardized the weekly sales by store before running the algorithm, so the effect of the store was not captured. Other unimportant variables were `unemployment` and `year`.
+
+
 
