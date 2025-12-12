@@ -77,9 +77,7 @@ holiday spikes that motivate our lagged and seasonal feature engineering.
 Top panel: **Test MSE** by model.  
 Bottom panel: **Test WAPE (%)** by model.
 
-This figure shows that engineered-feature LASSO and ARIMA are competitive, and
-that naive ARIMAX can underperform when many exogenous variables are added
-without regularization.
+The figure indicates that XGBoost achieves the strongest overall performance, outperforming the other methods on both evaluation metrics.
 
 ![Model comparison on test set](data/walmart_results.png)
 
