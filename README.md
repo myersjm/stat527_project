@@ -1,75 +1,122 @@
-# Walmart Store Sales
+# STAT 527 Final Project  
+## Retail Sales Forecasting: Time-Series Variable Selection on Walmart Data
+
+This repository contains the code and artifacts for our STAT 527 final project on
+**store-level weekly sales forecasting** and **variable selection** using the Walmart
+Kaggle dataset.
+
+We compare several forecasting models on a leakage-safe, feature-engineered
+time-series panel:
+
+- **Baseline LASSO** with only original covariates  
+- **LASSO with engineered lag/seasonal features**  
+- **XGBoost** gradient boosted trees  
+- **ARIMA** (univariate)  
+- **ARIMAX** with exogenous covariates  
+
+The primary goals are to:
+1. Quantify out-of-sample accuracy across methods, and  
+2. Understand which covariates are consistently selected as important drivers of sales.
+
+Our main evaluation metrics are **WAPE (Weighted Absolute Percentage Error)** and
+**MSE** on a **held-out test window** using expanding-window time-series
+cross-validation for model selection.
+
+---
 
 ## Data
 
-Weekly panel at **Store × Week** granularity with target **`Weekly_Sales`** and covariates (`Holiday_Flag`, `Temperature`, `Fuel_Price`, `CPI`, `Unemployment`). One row = one **store-week**.
+We use the public Walmart weekly sales dataset (45 stores over ~3 years).  
+Core fields include:
+
+- `Weekly_Sales` (target), `Store`, `Date`, `Holiday_Flag`,  
+- `Temperature`, `Fuel_Price`, `CPI`, `Unemployment`.
+
+We engineer **leakage-safe features** per store:
+
+- Lagged sales (1, 2, 4, 8 weeks), rolling means, expanding mean/sd  
+- Fourier seasonal terms, month/quarter/week indicators  
+- Interactions (e.g., holiday × lagged sales, CPI × unemployment)
 
 ---
 
-## Phase 1 — EDA & Integrity (done)
+## Methods (High-Level)
 
-* **Schema normalized:** snake_case columns; `date` parsed; `store` as factor; `holiday_flag` as {Non-Holiday, Holiday}.
-* **Key integrity:** exactly **one row per (store, date)**.
-* **Cadence:** weekly; non-7-day gaps flagged per store (informational).
-* **Profiles saved:**
+- **LASSO**  
+  Linear regression with \(\ell_1\) regularization for sparse variable selection.
+  We fit models with and without the engineered feature set.
 
-  * Distributions (sales & covariates)
-  * Total sales over time
-  * Holiday vs non-holiday trajectories
-  * Top stores by sales
-  * Per-store small multiples
-  * Numeric correlation matrix
-* **Calendar added:** `week`, `month`, `year`, `is_q4`.
+- **XGBoost**  
+  Gradient boosted trees over all features, capturing nonlinearities and
+  interactions. Feature importance is based on gain.
 
-**Outcome:** data is clean, keyed, and temporally coherent for feature building and time-aware CV.
+- **ARIMA / ARIMAX**  
+  Store-specific time-series models chosen by `auto.arima`, with and without
+  exogenous regressors.
 
----
-
-## Phase 2 — Leakage-Safe Features (done)
-
-All history features are computed **within store** using **only past weeks** (no look-ahead).
-
-**History**
-
-* Lags: `lag1`, `lag2`, `lag4`, `lag8`
-* Past-only moving averages: `ma4`, `ma8` (rolling mean, then shifted by one week)
-* Expanding stats up to t-1: `store_mean_to_prev`, `store_sd_to_prev`
-
-**Seasonality & Calendar**
-
-* Fourier harmonics: `sin1`, `cos1`, `sin2`, `cos2` (week-of-year)
-* `is_q4`, `holiday_flag`, numeric `is_holiday_num`
-
-**Exogenous**
-
-* `temperature`, `fuel_price`, `cpi`, `unemployment`
-
-**Pre-declared interactions**
-
-* `inter_holiday_lag1 = is_holiday_num * lag1`
-* `inter_temp_holiday = temperature * is_holiday_num`
-* `inter_cpi_unemp = cpi * unemployment`
-
-**Row eligibility**
-
-* Trimmed to observations with sufficient history (`lag8`, `ma8`, `store_mean_to_prev` not NA).
-
-**Leakage audits (passed)**
-
-* Early-row NA check (pre-trim)
-* **Rolling correctness:** `ma4 == mean(lag1..lag4)` where defined
-* Weekly spacing audit (informational)
-
-**Artifacts**
-
-* `data/walmart_features.rds`
-* `data/walmart_features.csv`
+All hyperparameters are tuned via **expanding-window cross-validation**, then
+models are refit on train+validation and evaluated once on the final test window.
 
 ---
 
-## Ready for Phase 3 — Modeling
+## Key Figures and Demo
 
-* **Splits:** Train = 2010–2011 (with **blocked rolling CV** inside); Test = 2012.
-* **Models to compare:** **LASSO**, **Ridge**, **Gradient Boosting**, **ARIMA** (per-store; optional ARIMAX).
-* **Within-fold preprocessing:** build model matrices / scaling / encodings **inside CV** only.
-* **Report:** MAE/RMSE on holdout, selection stability (LASSO), coefficient rank stability (Ridge), importance + PDP/ALE (GBM), ARIMA vs GBM per-store comparison.
+These three artifacts summarize the project at a glance.
+
+### 1. Aggregate Sales Over Time
+
+Total weekly sales across all stores. This highlights strong seasonality and
+holiday spikes that motivate our lagged and seasonal feature engineering.
+
+![Total weekly sales over time](data/plots/wm_total_weekly_sales_ts.png)
+
+---
+
+### 2. Final Test Performance
+
+Top panel: **Test MSE** by model.  
+Bottom panel: **Test WAPE (%)** by model.
+
+This figure shows that engineered-feature LASSO and ARIMA are competitive, and
+that naive ARIMAX can underperform when many exogenous variables are added
+without regularization.
+
+![Model comparison on test set](data/walmart_results.png)
+
+---
+
+### 3. Interactive Shiny Demo
+
+Animated walkthrough of the Shiny app used to explore the models.
+
+The app lets users:
+
+- Select a **store** and **history window**  
+- View the **best-WAPE** and **most sparse** models  
+- Visualize **train vs. test forecasts** and inspect how predictions change
+  across stores and models.
+
+![Interactive Shiny demo](demo/demo-vs.gif)
+
+The app is intended as a teaching and exploration tool and uses the same
+trained models and hyperparameters reported in the paper.
+
+---
+
+## Reproducibility (Sketch)
+
+1. **Install dependencies**  
+   - R (with `glmnet`, `forecast`, `xgboost`, `shiny`, `tidyverse`, etc. see model notebooks for detail.)
+2. **Obtain data**  
+   - Download the Walmart dataset from Kaggle and place it under `data/`
+     as described in the scripts.
+     - Walmart Retail: https://www.kaggle.com/datasets/yasserh/walmart-dataset/data
+3. **Run pipelines**  
+   - Preprocess and engineer features  
+   - Train each model (LASSO variants, XGBoost, ARIMA/ARIMAX)  
+   - Recompute WAPE/MSE and regenerate the figures above.
+4. **Launch the Shiny app (optional)**  
+   - Run the app script (see `demo/`) to interactively explore forecasts.
+
+For exact scripts and command sequences, see the comments in the R files and
+the accompanying report.
