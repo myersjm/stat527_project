@@ -142,7 +142,8 @@ param_grid <- expand.grid(
   eta = c(0.05, 0.1, 0.25),
   gamma = c(0.1, 1, 5),
   subsample = c(0.5, 1),
-  colsample_bytree = c(0.5, 1)
+  colsample_bytree = c(0.5, 1),
+  tree_method = "hist"
 )
 
 # function to calculate WAPE
@@ -226,7 +227,7 @@ testYlab <- test_std %>% select(store, weekly_sales)
 We are ready to train and test the model.
 
 ```{r}
-set.seed(5)
+set.seed(3)
 
 opt_param_list <- lapply(opt_params, function(x) x)
 
@@ -244,6 +245,8 @@ joined_yhat <- testYlab %>% left_join(y_mean_sd, by = "store") %>%
 yhat <- joined_yhat$pred_denorm
   
 calculate_WAPE(testYlab$weekly_sales, yhat)
+
+mean((testYlab$weekly_sales - yhat)^2) # MSE
 ```
 
 
